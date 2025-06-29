@@ -1,13 +1,20 @@
 #!/usr/bin/env Rscript
 
 # FDA Classification Pipeline (Auto-Fetch from openFDA)
-# Refactored for dynamic data retrieval
+# Refactored for dynamic data retrieval with robust encoding and class reconciliation
 
 # 0. Setup: CRAN mirror and package loading
-# options(repos = c(CRAN = "https://cloud.r-project.org"))
-pkgs <- c("httr","jsonlite","tidyverse","caret","smotefamily","ranger","progress","MLmetrics","glmnet","lightgbm")
+options(repos = c(CRAN = "https://cloud.r-project.org"))
+
+# options(error = recover)
+# source("FDA_AutoUpdate.r", encoding="UTF-8")
+
+pkgs <- c(
+  "httr", "jsonlite", "tidyverse", "caret", "smotefamily",
+  "ranger", "progress", "MLmetrics", "glmnet", "lightgbm"
+)
 new_pkgs <- pkgs[!pkgs %in% installed.packages()[,"Package"]]
-if(length(new_pkgs)) install.packages(new_pkgs)
+if (length(new_pkgs)) install.packages(new_pkgs)
 
 library(httr)
 library(jsonlite)
@@ -22,194 +29,284 @@ library(lightgbm)
 
 # --- Helper Functions ---
 
-# 1. Fetch latest FDA food enforcement data via openFDA API
+# 1. Fetch data
 fetch_fda_data <- function(limit = 1000) {
-  url <- "https://api.fda.gov/food/enforcement.json"
-  resp <- GET(url, query = list(limit = limit))
+  resp <- GET("https://api.fda.gov/food/enforcement.json", query = list(limit = limit))
   stop_for_status(resp)
-  data_list <- content(resp, "text", encoding = "UTF-8") %>% fromJSON(flatten = TRUE)
-  df <- as_tibble(data_list$results)
-  return(df)
+  fromJSON(content(resp, "text", encoding = "UTF-8"), flatten = TRUE)$results %>%
+    as_tibble()
 }
 
-raw = fetch_fda_data((limit = 1000))
-names(raw)
-
-head(raw)
-
-str(raw)
-
-# 2. Clean raw FDA data frame
+# 2. Clean data
 clean_data <- function(df) {
-  df_clean <- df %>%
+  df %>%
     rename(
       Classification   = status,
-      Country_Area      = country,
-      Posted_Citations  = voluntary_mandated,
-      Project_Area      = product_description,
-      Product_Type      = product_type
+      State            = state,
+      Country_Area     = country,
+      Posted_Citations = voluntary_mandated,
+      Project_Area     = product_description,
+      Product_Type     = product_type,
+      Report_Date      = report_date
     ) %>%
-    select(
-      Classification,
-      State             = state,
-      Country_Area,
-      Posted_Citations,
-      Project_Area,
-      Product_Type,
-      Fiscal_Year       = report_date
+    transmute(
+      Classification   = factor(Classification),
+      State            = factor(State),
+      Country_Area     = factor(Country_Area),
+      Posted_Citations = factor(Posted_Citations),
+      Project_Area     = factor(Project_Area),
+      Product_Type     = factor(Product_Type),
+      Fiscal_Year      = as.integer(substr(Report_Date, 1, 4))
     ) %>%
-    mutate(
-      across(where(is.character), factor),
-      Classification = factor(Classification),
-      Fiscal_Year    = as.integer(substr(Fiscal_Year, 1, 4))
-    ) %>%
-    drop_na()
+    drop_na() %>%
+    group_by(Classification) %>%
+    filter(n() >= 2) %>%
+    ungroup() -> df_clean
+
   levels(df_clean$Classification) <- make.names(levels(df_clean$Classification))
-  return(df_clean)
+  df_clean
 }
 
 # 3. Encode predictors via one-hot and sanitize names
-#    also remove zero-variance columns
-encode_predictors <- function(df, dummy_obj = NULL) {
-  if (is.null(dummy_obj)) {
-    dummy_obj <- dummyVars(Classification ~ ., data = df)
-  }
-  X <- predict(dummy_obj, df) %>% as.data.frame()
-  # remove zero-variance
+#    Drops single-level and zero-variance predictors, separates y
+encode_predictors <- function(df) {
+  # Extract response as a proper factor
+  y <- factor(df$Classification)
+  # Extract predictor columns
+  preds <- df %>% select(-Classification)
+  # Drop factor predictors with only one level
+  single <- sapply(preds, function(x) is.factor(x) && nlevels(x) < 2)
+  preds <- preds[, !single, drop = FALSE]
+  # Create dummyVars for predictors only
+  dummy_obj <- dummyVars(~ ., data = preds)
+  # Generate one-hot matrix
+  X <- predict(dummy_obj, newdata = preds) %>% as.data.frame()
+  # Remove near-zero variance columns
   nz <- nearZeroVar(X)
-  if (length(nz) > 0) X <- X[, -nz, drop = FALSE]
-  clean_names <- make.names(colnames(X))
-  colnames(X)  <- clean_names
-  y <- df$Classification
+  if (length(nz)) X <- X[, -nz, drop = FALSE]
+  # Sanitize column names
+  names(X) <- make.names(names(X))
   return(list(X = X, y = y, obj = dummy_obj))
 }
 
+
 # 4. Balance classes via SMOTE
 balance_smote <- function(X, y) {
-  sm      <- SMOTE(X = X, target = y, K = 5)
-  df_bal  <- sm$data
-  names(df_bal)[ncol(df_bal)] <- "Classification"
-  df_bal$Classification <- factor(df_bal$Classification, levels = levels(y))
-  # reapply zero-variance removal
-  nz2 <- nearZeroVar(df_bal[, -ncol(df_bal)])
-  if (length(nz2) > 0) df_bal <- df_bal[, -nz2]
-  return(df_bal)
+  sm <- SMOTE(X = X, target = y, K = 5)
+  dfb <- sm$data
+  names(dfb)[ncol(dfb)] <- "Classification"
+  dfb$Classification <- factor(dfb$Classification, levels = levels(y))
+  nz2 <- nearZeroVar(dfb[,-ncol(dfb)])
+  if (length(nz2)) dfb <- dfb[, -nz2]
+  dfb
 }
 
-# # 5. Train Random Forest model via ranger
-# f_train_rf <- function(df_bal) {
+# # 5. Train Random Forest
+# f_train_rf <- function(dfb) {
+#   dfb$Classification <- factor(dfb$Classification)
 #   ctrl <- trainControl(
-#     method          = "cv",
-#     number          = 5,
-#     classProbs      = TRUE,
+#     method = "cv", number = 5,
+#     classProbs = TRUE,
 #     summaryFunction = multiClassSummary,
-#     verboseIter     = TRUE
+#     verboseIter = TRUE
 #   )
-#   p <- ncol(df_bal) - 1
-#   mtry_vals <- unique(floor(seq(1, p, length.out = 3)))
+#   p <- ncol(dfb) - 1
 #   tuneGrid <- expand.grid(
-#     mtry           = mtry_vals,
-#     splitrule      = "gini",
-#     min.node.size  = 1
+#     mtry = unique(floor(seq(1, p, length.out = 3))),
+#     splitrule = "gini",
+#     min.node.size = 1
 #   )
 #   set.seed(456)
-#   rf <- train(
-#     Classification ~ .,
-#     data       = df_bal,
-#     method     = "ranger",
-#     trControl  = ctrl,
-#     tuneGrid   = tuneGrid,
-#     num.trees  = 500,
+#   train(
+#     Classification ~ ., data = dfb,
+#     method = "ranger",
+#     trControl = ctrl,
+#     tuneGrid = tuneGrid,
+#     num.trees = 500,
 #     importance = 'impurity'
+#   )
+# }
+
+
+# 5. Train Random Forest directly via ranger (bypass caret)
+# f_train_rf <- function(dfb) {
+#   dfb$Classification <- factor(dfb$Classification)
+#   num.trees <- 500
+#   mtry      <- floor(sqrt(ncol(dfb) - 1))
+#   # Train probability forest
+#   rf <- ranger::ranger(
+#     formula     = Classification ~ .,
+#     data        = dfb,
+#     num.trees   = num.trees,
+#     mtry        = mtry,
+#     importance  = 'impurity',
+#     probability = TRUE
 #   )
 #   return(rf)
 # }
+# debugonce(f_train_rf)
+# # then call it manually:
+# rf_model <- f_train_rf(baldf)
 
-# 6. Train Elastic Net (glmnet)
+# print(is.function(f_train_rf))  
+# # and also
+# print(ls())
+
+# traceback()
+
+
+# print(exists("ranger"))
+# print(typeof(ranger))
+# typeof(ranger)
+
+
+# 6. Train Elastic Net
+
+
+# f_train_glm <- function(X, y) {
+#   xmat <- as.matrix(X)
+#   yvec <- as.numeric(y) - 1
+  
+  
+# tryCatch({
+#     glm_model <- glmnet::cv.glmnet(
+#       x                 = xmat,
+#       y                 = yvec,
+#       family            = "multinomial",
+#       alpha             = 0.5,
+#       type.multinomial  = "ungrouped",
+#       maxit             = 1e5
+#     )
+#     return(glm_model)
+#   }, error = function(e) {
+#     cat("Error in cv.glmnet():\n")
+#     print(e)
+#     # drop into interactive debug
+#     browser()
+#     # if you want to return NULL on error:
+#     # return(NULL)
+#   })
+# }
+
+
 f_train_glm <- function(X, y) {
-  x_mat <- as.matrix(X)
-  y_vec <- as.numeric(y) - 1
-  cvm   <- cv.glmnet(
-    x_mat, y_vec,
-    family = "multinomial",
-    alpha  = 0.5
-  )
-  return(cvm)
+  cat("▶ ENTER f_train_glm()\n")
+  xmat <- as.matrix(X)
+  yvec <- as.numeric(y) - 1
+  cat("  – xmat & yvec built (", nrow(xmat), "×", ncol(xmat), "); length(yvec)=", length(yvec), "\n")
+
+  cat("▶ about to enter tryCatch\n")
+  result <- tryCatch({
+    cat("    – inside TRY, before cv.glmnet()\n")
+    m <- glmnet::cv.glmnet(
+      x                 = xmat,
+      y                 = yvec,
+      family            = "multinomial",
+      alpha             = 0.5,
+      type.multinomial  = "ungrouped",
+      maxit             = 1e5
+    )
+    cat("    – cv.glmnet() returned successfully\n")
+    m
+  }, error = function(e) {
+    cat("🚨 CAUGHT ERROR in cv.glmnet:\n")
+    print(e)
+    browser()    # drop you into the debugger right here
+    NULL         # so the function returns NULL after you exit browser()
+  })
+
+  cat("▶ EXIT f_train_glm(), returning ", if (is.null(result)) "NULL\n" else "model object\n")
+  return(result)
 }
 
-# 7. Train LightGBM
+
+
+
+# # 7. Train LightGBM
 # f_train_lgb <- function(X, y) {
-#   dtrain <- lgb.Dataset(
-#     data  = as.matrix(X),
-#     label = as.numeric(y) - 1
-#   )
-#   params <- list(
-#     objective = "multiclass",
-#     num_class = length(levels(y)),
-#     metric    = "multi_error"
-#   )
-#   model <- lgb.train(
-#     params  = params,
-#     data    = dtrain,
-#     nrounds = 100,
-#     verbose = -1
-#   )
-#   return(model)
+#   dtrain <- lgb.Dataset(data = as.matrix(X), label = as.numeric(y) - 1)
+#   params <- list(objective = "multiclass", num_class = length(levels(y)), metric = "multi_error")
+#   lgb.train(params, dtrain, nrounds = 100, verbose = -1)
 # }
 
 # --- Main Execution ---
-# Progress bar setup
-pb <- progress_bar$new(
-  total  = 5,
-  format = "[:bar] Step :current/:total :message",
-  clear  = FALSE
-)
+prog <- progress_bar$new(total = 5, format = "[:bar] Step :current/:total :message", clear = FALSE)
 
-# Step 1: Fetch
-pb$tick(tokens = list(message = "Fetching FDA data..."))
-raw <- fetch_fda_data(limit = 1000)
+# 1. Fetch
+d <- fetch_fda_data(1000)
 
-# Step 2: Clean
-pb$tick(tokens = list(message = "Cleaning data..."))
-data <- clean_data(raw)
+# 2. Clean
+prog$tick(tokens = list(message = "Cleaning data..."))
+d <- clean_data(d)
 
-# Step 3: Split
-pb$tick(tokens = list(message = "Splitting data..."))
+# 3. Split
+prog$tick(tokens = list(message = "Splitting data..."))
 set.seed(123)
-idx      <- createDataPartition(data$Classification, p = 0.7, list = FALSE)
-train_df <- data[idx, ]
-test_df  <- data[-idx, ]
-test_df$Classification <- factor(
-  test_df$Classification,
-  levels = levels(data$Classification)
-)
+idx <- createDataPartition(d$Classification, p = 0.7, list = FALSE)
+train_df <- droplevels(d[idx, ])
+test_df  <- droplevels(d[-idx, ])
 
-# Step 4: Encode & Balance
-pb$tick(tokens = list(message = "Encoding & balancing..."))
-enc    <- encode_predictors(train_df)
-bal_df <- balance_smote(enc$X, enc$y)
-test_enc <- encode_predictors(test_df)
+# Reconcile factor levels
+fac_cols <- names(train_df)[sapply(train_df, is.factor)]
+for (col in fac_cols) {
+  lv <- union(levels(train_df[[col]]), levels(test_df[[col]]))
+  train_df[[col]] <- factor(train_df[[col]], levels = lv)
+  test_df[[col]]  <- factor(test_df[[col]],  levels = lv)
+}
 
-# Step 5: Train & Save Models
-pb$tick(tokens = list(message = "Training models..."))
-# rf_model  <- f_train_rf(bal_df)
-cv_glm    <- f_train_glm(enc$X, enc$y)
-# lgb_model <- f_train_lgb(enc$X, enc$y)
+# 4. Encode & Balance
+prog$tick(tokens = list(message = "Encoding & balancing..."))
+enc <- encode_predictors(train_df)
+# baldf <- balance_smote(enc$X, enc$y)
 
-# Persist models
-dir.create("models", showWarnings = FALSE)
-# saveRDS(
-#   rf_model,
-#   file = "models/rf_fda_model.rds"
-# )
-saveRDS(
-  cv_glm,
-  file = "models/cv_glmnet_fda_model.rds"
-)
-# lgb.save(
-#   lgb_model,
-#   filename = "models/lgb_fda_model.txt"
-# )
+# print(class(baldf))
+# str(baldf)
 
-pb$finish()
-message("All models trained and saved in 'models/' directory.")
+
+#–– diagnostics:
+str(enc$X)
+str(enc$y)
+cat("dims X:", dim(enc$X), "; length y:", length(enc$y), "\n")
+
+# Test encoding
+# This should no longer error
+# enc <- encode_predictors(train_df)
+
+# # Encode test set
+# test_enc <- predict(enc$obj, newdata = test_df) %>% as.data.frame()
+# test_X <- test_enc[, intersect(names(test_enc), names(baldf)), drop = FALSE]
+# test_y <- test_df$Classification
+
+# 5. Train & Save
+prog$tick(tokens = list(message = "Training models..."))
+# rf_model   <- f_train_rf(baldf)
+glm_model <- f_train_glm(enc$X, enc$y)
+# lgbm_model <- f_train_lgb(enc$X, enc$y)
+# dir.create("models", showWarnings = FALSE)
+# # saveRDS(rf_model,   "models/rf_model.rds")
+# saveRDS(glm_model,  "models/glm_model.rds")
+# # lgb.save(lgbm_model, "models/lgbm_model.txt")
+
+cat("Got glm_model, saving now…\n")
+# # diagnostic prints
+cat("is dir.create() a function? ", is.function(dir.create), "\n")
+cat("typeof(dir.create): ", typeof(dir.create), "\n")
+cat("is saveRDS() a function?   ", is.function(saveRDS), "\n")
+cat("typeof(saveRDS):   ", typeof(saveRDS), "\n")
+
+# force base namespace
+base::dir.create("models", showWarnings = FALSE)
+base::saveRDS(glm_model, "models/glm_model.rds")
+cat("✅ glm_model.rds saved!\n")
+
+# prog$finish()
+# cat("→ class(prog):", class(prog),        "\n")
+# cat("→ names(prog):", paste(names(prog), collapse = ", "), "\n")
+# cat("→ is.function(prog$finish):", is.function(prog$finish), "\n")
+
+
+
+# message("✓ Done.")
+# # prog$finish()
+# # message("Models saved in 'models/' directory.")
+
