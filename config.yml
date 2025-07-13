@@ -1,0 +1,19 @@
+# config.yaml
+
+fda:
+  endpoint: https://api.fda.gov/food/enforcement.json
+  limit: 1000
+  date_from : "2020-01-01"
+  date_to : "2025-06-30"
+
+model:
+  alpha:    0.5
+  family:   "multinomial"
+  maxit:    1e5
+
+paths:
+  raw_data:   "data/raw/fda.json"
+  clean_data: "data/processed/clean.csv"
+  enc_data:   "/Users/anishgkaushik/Desktop/GK_Stuffs/FDA_Analysis_App/models/encoded_data.rds"
+  perf:       "/Users/anishgkaushik/Desktop/GK_Stuffs/FDA_Analysis_App/models/performance.rds"
+  glm_model:  "/Users/anishgkaushik/Desktop/GK_Stuffs/FDA_Analysis_App/models/glm_model.rds"
